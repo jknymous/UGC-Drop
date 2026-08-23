@@ -126,6 +126,12 @@ async function runPollCycle(client) {
       const enriched = await enrichItem(raw);
       if (!enriched) continue;
 
+      // Skip item dari map yang udah di-blok (misal map spam kayak "Flex UGC Codes")
+      if (db.isMapBlocked({ gameName: enriched.gameName, universeId: enriched.universeId })) {
+        console.log(`[poller] Skip item ${enriched.itemId} (${enriched.name}) - map di-blok: ${enriched.gameName}`);
+        continue;
+      }
+
       const wasTracked = db.getItem(enriched.itemId);
       const isSoldOut = enriched.quantityTotal !== null && enriched.quantityRemaining === 0;
 

@@ -34,6 +34,15 @@ CREATE TABLE IF NOT EXISTS map_overrides (
   set_by TEXT,
   set_at TEXT DEFAULT (datetime('now'))
 );
+
+-- Daftar map/game yang item-nya mau di-skip (ga usah diposting sama sekali)
+CREATE TABLE IF NOT EXISTS blocked_maps (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  game_name_pattern TEXT NOT NULL,  -- dicocokin case-insensitive, partial match
+  universe_id INTEGER,               -- opsional, kalau mau blok berdasarkan universe id persis
+  blocked_by TEXT,
+  blocked_at TEXT DEFAULT (datetime('now'))
+);
 `);
 
 module.exports = {
@@ -105,5 +114,34 @@ module.exports = {
         set_by = excluded.set_by,
         set_at = datetime('now')
     `).run(itemId, gameName, gameUrl, setBy);
+  },
+
+  addBlockedMap(gameNamePattern, universeId, blockedBy) {
+    db.prepare(`
+      INSERT INTO blocked_maps (game_name_pattern, universe_id, blocked_by)
+      VALUES (?, ?, ?)
+    `).run(gameNamePattern, universeId || null, blockedBy);
+  },
+
+  removeBlockedMap(id) {
+    db.prepare('DELETE FROM blocked_maps WHERE id = ?').run(id);
+  },
+
+  getBlockedMaps() {
+    return db.prepare('SELECT * FROM blocked_maps ORDER BY id').all();
+  },
+
+  /**
+   * Cek apakah sebuah item (berdasarkan game name / universe id) masuk daftar blokir.
+   */
+  isMapBlocked({ gameName, universeId }) {
+    const blocked = module.exports.getBlockedMaps();
+    return blocked.some((b) => {
+      if (b.universe_id && universeId && Number(b.universe_id) === Number(universeId)) return true;
+      if (b.game_name_pattern && gameName) {
+        return gameName.toLowerCase().includes(b.game_name_pattern.toLowerCase());
+      }
+      return false;
+    });
   },
 };
