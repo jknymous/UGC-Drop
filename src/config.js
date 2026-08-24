@@ -16,7 +16,8 @@ module.exports = {
   liveChannelId: required('LIVE_CHANNEL_ID'),
   soldoutChannelId: required('SOLDOUT_CHANNEL_ID'),
 
-  pollIntervalMinutes: parseInt(process.env.POLL_INTERVAL_MINUTES || '5', 10),
+  pollIntervalMinutes: parseInt(process.env.POLL_INTERVAL_MINUTES || '2', 10),
+  pollMaxPages: parseInt(process.env.POLL_MAX_PAGES || '15', 10),
 
   catalogCategory: process.env.CATALOG_CATEGORY || '11',
   catalogSubcategory: process.env.CATALOG_SUBCATEGORY || '',

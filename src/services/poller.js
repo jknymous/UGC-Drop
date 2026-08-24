@@ -5,18 +5,44 @@ const config = require('../config');
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+let isRunning = false;
+
 /**
  * Ambil detail lengkap 1 item dari hasil search (economy + thumbnail + game info).
  * Return null kalau gagal fetch (item ke-delist, API error, dll) - biar polling lanjut jalan.
  */
+/**
+ * Ambil detail lengkap 1 item dari hasil search (thumbnail + game info).
+ * Field quantity (unitsAvailableForConsumption, totalQuantity) buat item Limited UGC
+ * udah nempel LANGSUNG di response search API (searchResult), jadi kita pake itu duluan.
+ * Endpoint economy API cuma dipake buat fallback/pelengkap data non-quantity kalau perlu.
+ */
 async function enrichItem(searchResult) {
   const itemId = searchResult.id;
   try {
-    const details = await robloxApi.getAssetDetails(itemId);
+    // Ambil quantity langsung dari hasil search - ini yang paling akurat buat Limited UGC
+    let quantityTotal = searchResult.totalQuantity ?? null;
+    let quantityRemaining = searchResult.unitsAvailableForConsumption ?? null;
+    let priceRobux = searchResult.price ?? 0;
+    let creatorName = searchResult.creatorName ?? null;
+    let creatorType = searchResult.creatorType ?? null;
+    let name = searchResult.name;
 
-    // SaleLocation biasanya berupa { saleLocationType, universeIds: [...] }
-    // strukturnya bisa beda tergantung versi API - sesuaikan kalau perlu setelah dites.
-    const universeIds = details?.SaleLocation?.UniverseIds || details?.saleLocation?.universeIds || [];
+    // SaleLocation (buat map/game info) masih perlu manggil economy API terpisah,
+    // karena field ini nggak selalu ikut di response search.
+    let universeIds = [];
+    try {
+      const details = await robloxApi.getAssetDetails(itemId);
+      universeIds = details?.SaleLocation?.UniverseIds || details?.saleLocation?.universeIds || [];
+      // Kalau search result kosong tapi economy API ada datanya, pake sebagai fallback
+      if (quantityTotal === null) quantityTotal = details.TotalQuantity ?? details.totalQuantity ?? null;
+      if (quantityRemaining === null) quantityRemaining = details.UnitsAvailableForConsumption ?? details.unitsAvailableForConsumption ?? null;
+      if (!creatorName) creatorName = details.Creator?.Name;
+      if (!creatorType) creatorType = details.Creator?.CreatorType;
+    } catch (err) {
+      console.warn(`[poller] Economy API gagal buat item ${itemId} (skip SaleLocation): ${err.message}`);
+    }
+
     let gameName = null;
     let gameUrl = null;
 
@@ -40,19 +66,16 @@ async function enrichItem(searchResult) {
 
     const thumbs = await robloxApi.getThumbnails([itemId]);
 
-    const quantityTotal = details.UnitsAvailableForConsumption ?? details.Sales?.Total ?? null;
-    const quantityRemaining = details.UnitsAvailableForConsumption ?? null;
-
     return {
       itemId,
-      name: details.Name || searchResult.name,
-      creatorName: details.Creator?.Name || searchResult.creatorName,
-      creatorType: details.Creator?.CreatorType || searchResult.creatorType,
+      name,
+      creatorName,
+      creatorType,
       thumbnailUrl: thumbs[itemId] || null,
       universeId: universeIds[0] || null,
       gameName,
       gameUrl,
-      priceRobux: details.PriceInRobux ?? 0,
+      priceRobux,
       quantityTotal,
       quantityRemaining,
     };
@@ -103,60 +126,70 @@ async function moveToSoldOut(client, item) {
 }
 
 async function runPollCycle(client) {
-  console.log(`[poller] Mulai polling cycle - ${new Date().toISOString()}`);
-  let cursor = '';
-  let totalChecked = 0;
-  const maxPages = 5; // batasin jumlah page per cycle biar ga kena rate limit / kelamaan
-
-  for (let page = 0; page < maxPages; page++) {
-    let searchResult;
-    try {
-      searchResult = await robloxApi.searchFreeItems({
-        category: config.catalogCategory,
-        subcategory: config.catalogSubcategory,
-        cursor,
-      });
-    } catch (err) {
-      console.error('[poller] Gagal search catalog:', err.message);
-      break;
-    }
-
-    for (const raw of searchResult.items) {
-      totalChecked++;
-      const enriched = await enrichItem(raw);
-      if (!enriched) continue;
-
-      // Skip item dari map yang udah di-blok (misal map spam kayak "Flex UGC Codes")
-      if (db.isMapBlocked({ gameName: enriched.gameName, universeId: enriched.universeId })) {
-        console.log(`[poller] Skip item ${enriched.itemId} (${enriched.name}) - map di-blok: ${enriched.gameName}`);
-        continue;
-      }
-
-      const wasTracked = db.getItem(enriched.itemId);
-      const isSoldOut = enriched.quantityTotal !== null && enriched.quantityRemaining === 0;
-
-      const saved = db.upsertItem({
-        ...enriched,
-        status: isSoldOut ? 'soldout' : 'active',
-      });
-
-      if (isSoldOut) {
-        // baru sold out sekarang (sebelumnya active / belum pernah diproses ke soldout channel)
-        if (!wasTracked || wasTracked.status !== 'soldout') {
-          await moveToSoldOut(client, enriched);
-        }
-      } else {
-        await postOrUpdateLive(client, enriched);
-      }
-
-      await sleep(300); // jaga-jaga rate limit Roblox API
-    }
-
-    if (!searchResult.nextCursor) break;
-    cursor = searchResult.nextCursor;
+  if (isRunning) {
+    console.log('[poller] Cycle sebelumnya masih jalan, skip cycle ini biar ga numpuk.');
+    return;
   }
+  isRunning = true;
+  console.log(`[poller] Mulai polling cycle - ${new Date().toISOString()}`);
 
-  console.log(`[poller] Selesai. Total item dicek: ${totalChecked}`);
+  try {
+    let cursor = '';
+    let totalChecked = 0;
+    const maxPages = config.pollMaxPages; // sesuai .env, default dinaikin biar ga ada item kelewat
+
+    for (let page = 0; page < maxPages; page++) {
+      let searchResult;
+      try {
+        searchResult = await robloxApi.searchFreeItems({
+          category: config.catalogCategory,
+          subcategory: config.catalogSubcategory,
+          cursor,
+        });
+      } catch (err) {
+        console.error('[poller] Gagal search catalog:', err.message);
+        break;
+      }
+
+      for (const raw of searchResult.items) {
+        totalChecked++;
+        const enriched = await enrichItem(raw);
+        if (!enriched) continue;
+
+        // Skip item dari map yang udah di-blok (misal map spam kayak "Flex UGC Codes")
+        if (db.isMapBlocked({ gameName: enriched.gameName, universeId: enriched.universeId })) {
+          console.log(`[poller] Skip item ${enriched.itemId} (${enriched.name}) - map di-blok: ${enriched.gameName}`);
+          continue;
+        }
+
+        const wasTracked = db.getItem(enriched.itemId);
+        const isSoldOut = enriched.quantityTotal !== null && enriched.quantityRemaining === 0;
+
+        const saved = db.upsertItem({
+          ...enriched,
+          status: isSoldOut ? 'soldout' : 'active',
+        });
+
+        if (isSoldOut) {
+          // baru sold out sekarang (sebelumnya active / belum pernah diproses ke soldout channel)
+          if (!wasTracked || wasTracked.status !== 'soldout') {
+            await moveToSoldOut(client, enriched);
+          }
+        } else {
+          await postOrUpdateLive(client, enriched);
+        }
+
+        await sleep(200); // jaga-jaga rate limit Roblox API
+      }
+
+      if (!searchResult.nextCursor) break;
+      cursor = searchResult.nextCursor;
+    }
+
+    console.log(`[poller] Selesai. Total item dicek: ${totalChecked}`);
+  } finally {
+    isRunning = false;
+  }
 }
 
 module.exports = { runPollCycle };
