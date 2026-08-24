@@ -43,6 +43,13 @@ CREATE TABLE IF NOT EXISTS blocked_maps (
   blocked_by TEXT,
   blocked_at TEXT DEFAULT (datetime('now'))
 );
+
+-- Simpen posisi terakhir scan catalog (cursor) biar cycle berikutnya lanjut, bukan mulai dari 0 lagi
+CREATE TABLE IF NOT EXISTS scan_state (
+  id INTEGER PRIMARY KEY CHECK (id = 1),
+  last_cursor TEXT DEFAULT ''
+);
+INSERT OR IGNORE INTO scan_state (id, last_cursor) VALUES (1, '');
 `);
 
 module.exports = {
@@ -143,5 +150,14 @@ module.exports = {
       }
       return false;
     });
+  },
+
+  getLastCursor() {
+    const row = db.prepare('SELECT last_cursor FROM scan_state WHERE id = 1').get();
+    return row ? row.last_cursor : '';
+  },
+
+  setLastCursor(cursor) {
+    db.prepare('UPDATE scan_state SET last_cursor = ? WHERE id = 1').run(cursor || '');
   },
 };

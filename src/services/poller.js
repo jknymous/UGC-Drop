@@ -134,9 +134,10 @@ async function runPollCycle(client) {
   console.log(`[poller] Mulai polling cycle - ${new Date().toISOString()}`);
 
   try {
-    let cursor = '';
+    let cursor = db.getLastCursor(); // lanjut dari posisi terakhir, bukan mulai dari 0
     let totalChecked = 0;
-    const maxPages = config.pollMaxPages; // sesuai .env, default dinaikin biar ga ada item kelewat
+    const maxPages = config.pollMaxPages;
+    let reachedEnd = false;
 
     for (let page = 0; page < maxPages; page++) {
       let searchResult;
@@ -179,14 +180,20 @@ async function runPollCycle(client) {
           await postOrUpdateLive(client, enriched);
         }
 
-        await sleep(200); // jaga-jaga rate limit Roblox API
+        await sleep(150); // jaga-jaga rate limit Roblox API
       }
 
-      if (!searchResult.nextCursor) break;
+      if (!searchResult.nextCursor) {
+        reachedEnd = true;
+        break;
+      }
       cursor = searchResult.nextCursor;
     }
 
-    console.log(`[poller] Selesai. Total item dicek: ${totalChecked}`);
+    // Simpen posisi buat cycle berikutnya. Kalau abis (nyampe akhir katalog), muter balik ke awal.
+    db.setLastCursor(reachedEnd ? '' : cursor);
+
+    console.log(`[poller] Selesai. Total item dicek: ${totalChecked}${reachedEnd ? ' (nyampe akhir katalog, muter balik ke awal cycle berikutnya)' : ''}`);
   } finally {
     isRunning = false;
   }
