@@ -154,12 +154,26 @@ async function runPollCycle(client) {
 
       for (const raw of searchResult.items) {
         totalChecked++;
+
+        // Filter awal pake data mentah dari search result (belum fetch detail apapun) -
+        // biar item stock kecil langsung di-skip tanpa buang waktu/API call buat enrich.
+        const rawTotalQty = raw.totalQuantity ?? null;
+        if (config.minStock > 0 && rawTotalQty !== null && rawTotalQty < config.minStock) {
+          continue;
+        }
+
         const enriched = await enrichItem(raw);
         if (!enriched) continue;
 
         // Skip item dari map yang udah di-blok (misal map spam kayak "Flex UGC Codes")
         if (db.isMapBlocked({ gameName: enriched.gameName, universeId: enriched.universeId })) {
           console.log(`[poller] Skip item ${enriched.itemId} (${enriched.name}) - map di-blok: ${enriched.gameName}`);
+          continue;
+        }
+
+        // Filter kedua pake data yang udah di-enrich, jaga-jaga kalau raw search result ga ada totalQuantity-nya
+        if (config.minStock > 0 && enriched.quantityTotal !== null && enriched.quantityTotal < config.minStock) {
+          console.log(`[poller] Skip item ${enriched.itemId} (${enriched.name}) - stock ${enriched.quantityTotal} di bawah MIN_STOCK ${config.minStock}`);
           continue;
         }
 

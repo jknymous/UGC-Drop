@@ -18,6 +18,7 @@ module.exports = {
 
   pollIntervalMinutes: parseInt(process.env.POLL_INTERVAL_MINUTES || '2', 10),
   pollMaxPages: parseInt(process.env.POLL_MAX_PAGES || '15', 10),
+  minStock: parseInt(process.env.MIN_STOCK || '0', 10),
 
   catalogCategory: process.env.CATALOG_CATEGORY || '11',
   catalogSubcategory: process.env.CATALOG_SUBCATEGORY || '',
