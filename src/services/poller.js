@@ -194,7 +194,7 @@ async function runPollCycle(client) {
           await postOrUpdateLive(client, enriched);
         }
 
-        await sleep(150); // jaga-jaga rate limit Roblox API
+        await sleep(100); // jaga-jaga rate limit Roblox API
       }
 
       if (!searchResult.nextCursor) {

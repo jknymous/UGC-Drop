@@ -23,13 +23,13 @@ client.once('ready', () => {
   // Jalanin polling pertama kali begitu bot online
   runPollCycle(client).catch((err) => console.error('[poller] Error di cycle pertama:', err));
 
-  // Jadwalin polling berkala sesuai interval di .env
-  const cronExpr = `*/${config.pollIntervalMinutes} * * * *`;
+  // Jadwalin polling berkala sesuai interval di .env (support granularity detik)
+  const cronExpr = `*/${config.pollIntervalSeconds} * * * * *`; // format 6-field: detik menit jam tanggal bulan hari
   cron.schedule(cronExpr, () => {
     runPollCycle(client).catch((err) => console.error('[poller] Error di scheduled cycle:', err));
   });
 
-  console.log(`⏰ Polling dijadwalin tiap ${config.pollIntervalMinutes} menit.`);
+  console.log(`⏰ Polling dijadwalin tiap ${config.pollIntervalSeconds} detik.`);
 });
 
 client.on('interactionCreate', async (interaction) => {
