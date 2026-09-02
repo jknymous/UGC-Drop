@@ -5,6 +5,39 @@ const economyClient = axios.create({ baseURL: 'https://economy.roblox.com', time
 const thumbnailsClient = axios.create({ baseURL: 'https://thumbnails.roblox.com', timeout: 15000 });
 const gamesClient = axios.create({ baseURL: 'https://games.roblox.com', timeout: 15000 });
 
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/**
+ * Attach retry-with-backoff interceptor buat semua client - kalau kena 429 (rate limited),
+ * tunggu sesuai header Retry-After (atau exponential backoff kalau ga ada header itu), lalu retry.
+ * Max 3x retry per request biar ga infinite loop kalau Roblox lagi down beneran.
+ */
+function attachRetry(client) {
+  client.interceptors.response.use(
+    (res) => res,
+    async (error) => {
+      const config = error.config;
+      if (!config) return Promise.reject(error);
+      config.__retryCount = config.__retryCount || 0;
+
+      const isRateLimited = error.response && error.response.status === 429;
+      if (isRateLimited && config.__retryCount < 3) {
+        config.__retryCount += 1;
+        const retryAfterHeader = error.response.headers['retry-after'];
+        const waitMs = retryAfterHeader
+          ? parseFloat(retryAfterHeader) * 1000
+          : 1000 * Math.pow(2, config.__retryCount); // exponential backoff: 2s, 4s, 8s
+        console.warn(`[robloxApi] Kena rate limit (429), retry ke-${config.__retryCount} setelah ${waitMs}ms...`);
+        await sleep(waitMs);
+        return client(config);
+      }
+      return Promise.reject(error);
+    }
+  );
+}
+
+[catalogClient, economyClient, thumbnailsClient, gamesClient].forEach(attachRetry);
+
 /**
  * Search catalog buat item Free (price 0) di kategori tertentu.
  * Docs resmi: https://create.roblox.com/docs/projects/assets/api
