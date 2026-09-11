@@ -8,81 +8,117 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 let isRunning = false;
 
 /**
- * Ambil detail lengkap 1 item dari hasil search (economy + thumbnail + game info).
- * Return null kalau gagal fetch (item ke-delist, API error, dll) - biar polling lanjut jalan.
+ * Proses 1 halaman hasil search sekaligus (bukan 1 item per 1 item lagi):
+ * - Filter awal pake data mentah (MIN_STOCK) SEBELUM manggil API apapun lagi.
+ * - Batch call buat detail (1 request buat semua item yang lolos filter).
+ * - Batch call buat thumbnail (1 request).
+ * - SaleLocation (map/game info): coba dari batch details dulu, kalau ga ada baru fallback
+ *   ke economy API PER ITEM - tapi cuma buat item yang udah lolos filter (jauh lebih dikit
+ *   daripada 1 halaman penuh), jadi tetep hemat request dibanding sebelumnya.
+ * - Universe/game name di-resolve sekali per halaman (batch), bukan per item.
  */
-/**
- * Ambil detail lengkap 1 item dari hasil search (thumbnail + game info).
- * Field quantity (unitsAvailableForConsumption, totalQuantity) buat item Limited UGC
- * udah nempel LANGSUNG di response search API (searchResult), jadi kita pake itu duluan.
- * Endpoint economy API cuma dipake buat fallback/pelengkap data non-quantity kalau perlu.
- */
-async function enrichItem(searchResult) {
-  const itemId = searchResult.id;
+async function enrichPage(rawItems) {
+  // 1. Filter awal pake raw data - skip item stock kecil TANPA fetch apapun.
+  const candidates = rawItems.filter((raw) => {
+    const rawTotalQty = raw.totalQuantity ?? null;
+    if (config.minStock > 0 && rawTotalQty !== null && rawTotalQty < config.minStock) return false;
+    return true;
+  });
+
+  if (!candidates.length) return [];
+
+  const ids = candidates.map((c) => c.id);
+
+  // 2. Batch detail (1 request buat semua item di halaman ini)
+  let batchDetailsMap = {};
   try {
-    // Ambil quantity langsung dari hasil search - ini yang paling akurat buat Limited UGC
-    let quantityTotal = searchResult.totalQuantity ?? null;
-    let quantityRemaining = searchResult.unitsAvailableForConsumption ?? null;
-    let priceRobux = searchResult.price ?? 0;
-    let creatorName = searchResult.creatorName ?? null;
-    let creatorType = searchResult.creatorType ?? null;
-    let name = searchResult.name;
-
-    // SaleLocation (buat map/game info) masih perlu manggil economy API terpisah,
-    // karena field ini nggak selalu ikut di response search.
-    let universeIds = [];
-    try {
-      const details = await robloxApi.getAssetDetails(itemId);
-      universeIds = details?.SaleLocation?.UniverseIds || details?.saleLocation?.universeIds || [];
-      // Kalau search result kosong tapi economy API ada datanya, pake sebagai fallback
-      if (quantityTotal === null) quantityTotal = details.TotalQuantity ?? details.totalQuantity ?? null;
-      if (quantityRemaining === null) quantityRemaining = details.UnitsAvailableForConsumption ?? details.unitsAvailableForConsumption ?? null;
-      if (!creatorName) creatorName = details.Creator?.Name;
-      if (!creatorType) creatorType = details.Creator?.CreatorType;
-    } catch (err) {
-      console.warn(`[poller] Economy API gagal buat item ${itemId} (skip SaleLocation): ${err.message}`);
-    }
-
-    let gameName = null;
-    let gameUrl = null;
-
-    if (universeIds.length > 0) {
-      const universeInfo = await robloxApi.getUniverseInfo(universeIds);
-      const first = universeInfo[universeIds[0]];
-      if (first) {
-        gameName = first.name;
-        gameUrl = first.url;
-      }
-    }
-
-    // Fallback: kalau API ga kasih map info, cek manual override dari admin
-    if (!gameName) {
-      const override = db.getMapOverride(itemId);
-      if (override) {
-        gameName = override.game_name;
-        gameUrl = override.game_url;
-      }
-    }
-
-    const thumbs = await robloxApi.getThumbnails([itemId]);
-
-    return {
-      itemId,
-      name,
-      creatorName,
-      creatorType,
-      thumbnailUrl: thumbs[itemId] || null,
-      universeId: universeIds[0] || null,
-      gameName,
-      gameUrl,
-      priceRobux,
-      quantityTotal,
-      quantityRemaining,
-    };
+    const batch = await robloxApi.getCatalogItemsDetailsBatch(ids);
+    for (const d of batch) batchDetailsMap[d.id] = d;
   } catch (err) {
-    console.error(`[poller] Gagal enrich item ${itemId}:`, err.message);
-    return null;
+    console.warn('[poller] Batch details gagal, lanjut pake data search doang:', err.message);
   }
+
+  // 3. Batch thumbnail (1 request buat semua item)
+  let thumbs = {};
+  try {
+    thumbs = await robloxApi.getThumbnails(ids);
+  } catch (err) {
+    console.warn('[poller] Batch thumbnail gagal:', err.message);
+  }
+
+  // 4. Susun data dasar tiap item dulu, kumpulin mana yang masih butuh SaleLocation fallback
+  const enrichedDraft = [];
+  const needsSaleLocationLookup = [];
+
+  for (const raw of candidates) {
+    const batchInfo = batchDetailsMap[raw.id] || {};
+    const universeIdFromBatch =
+      batchInfo?.saleLocation?.universeIds?.[0] ?? batchInfo?.SaleLocation?.UniverseIds?.[0] ?? null;
+
+    const draft = {
+      itemId: raw.id,
+      name: batchInfo.name || raw.name,
+      creatorName: batchInfo.creatorName || raw.creatorName || null,
+      creatorType: batchInfo.creatorType || raw.creatorType || null,
+      priceRobux: batchInfo.price ?? raw.price ?? 0,
+      quantityTotal: raw.totalQuantity ?? batchInfo.totalQuantity ?? null,
+      quantityRemaining: raw.unitsAvailableForConsumption ?? batchInfo.unitsAvailableForConsumption ?? null,
+      thumbnailUrl: thumbs[raw.id] || null,
+      universeId: universeIdFromBatch,
+      gameName: null,
+      gameUrl: null,
+    };
+
+    if (!universeIdFromBatch) {
+      needsSaleLocationLookup.push(draft);
+    }
+
+    enrichedDraft.push(draft);
+  }
+
+  // 5. Fallback SaleLocation PER ITEM cuma buat yang emang ga ketemu dari batch details -
+  // biasanya ini sisa kecil doang, bukan seluruh halaman.
+  for (const draft of needsSaleLocationLookup) {
+    try {
+      const details = await robloxApi.getAssetDetails(draft.itemId);
+      const universeIds = details?.SaleLocation?.UniverseIds || details?.saleLocation?.universeIds || [];
+      if (universeIds.length) draft.universeId = universeIds[0];
+      // sekalian ambil quantity dari sini kalau masih kosong
+      if (draft.quantityTotal === null) draft.quantityTotal = details.TotalQuantity ?? details.totalQuantity ?? null;
+      if (draft.quantityRemaining === null) draft.quantityRemaining = details.UnitsAvailableForConsumption ?? details.unitsAvailableForConsumption ?? null;
+      await sleep(80); // tetep jaga rate limit walau ini fallback dikit
+    } catch (err) {
+      // gagal ambil SaleLocation buat item ini, ga masalah - lanjut aja tanpa map info
+    }
+  }
+
+  // 6. Resolve semua universeId yang berhasil ketemu jadi nama game - SEKALIGUS (1 request)
+  const uniqueUniverseIds = [...new Set(enrichedDraft.filter((d) => d.universeId).map((d) => d.universeId))];
+  let universeInfo = {};
+  if (uniqueUniverseIds.length) {
+    try {
+      universeInfo = await robloxApi.getUniverseInfo(uniqueUniverseIds);
+    } catch (err) {
+      console.warn('[poller] Gagal resolve universe info:', err.message);
+    }
+  }
+
+  for (const draft of enrichedDraft) {
+    if (draft.universeId && universeInfo[draft.universeId]) {
+      draft.gameName = universeInfo[draft.universeId].name;
+      draft.gameUrl = universeInfo[draft.universeId].url;
+    }
+    // Fallback terakhir: manual override dari admin (/addmapinfo)
+    if (!draft.gameName) {
+      const override = db.getMapOverride(draft.itemId);
+      if (override) {
+        draft.gameName = override.game_name;
+        draft.gameUrl = override.game_url;
+      }
+    }
+  }
+
+  return enrichedDraft;
 }
 
 async function postOrUpdateLive(client, item) {
@@ -109,7 +145,6 @@ async function moveToSoldOut(client, item) {
   const soldoutChannel = await client.channels.fetch(config.soldoutChannelId);
   const existing = db.getItem(item.itemId);
 
-  // Hapus/hilangin dari live channel
   if (existing?.live_message_id) {
     try {
       const msg = await liveChannel.messages.fetch(existing.live_message_id);
@@ -119,7 +154,6 @@ async function moveToSoldOut(client, item) {
     }
   }
 
-  // Post ke soldout channel
   const embed = buildSoldOutEmbed(item);
   const msg = await soldoutChannel.send({ embeds: [embed] });
   db.setSoldoutMessageId(item.itemId, msg.id);
@@ -134,7 +168,7 @@ async function runPollCycle(client) {
   console.log(`[poller] Mulai polling cycle - ${new Date().toISOString()}`);
 
   try {
-    let cursor = db.getLastCursor(); // lanjut dari posisi terakhir, bukan mulai dari 0
+    let cursor = db.getLastCursor();
     let totalChecked = 0;
     const maxPages = config.pollMaxPages;
     let reachedEnd = false;
@@ -152,49 +186,28 @@ async function runPollCycle(client) {
         break;
       }
 
-      for (const raw of searchResult.items) {
-        totalChecked++;
+      totalChecked += searchResult.items.length;
 
-        // Filter awal pake data mentah dari search result (belum fetch detail apapun) -
-        // biar item stock kecil langsung di-skip tanpa buang waktu/API call buat enrich.
-        const rawTotalQty = raw.totalQuantity ?? null;
-        if (config.minStock > 0 && rawTotalQty !== null && rawTotalQty < config.minStock) {
-          continue;
-        }
+      const enrichedItems = await enrichPage(searchResult.items);
 
-        const enriched = await enrichItem(raw);
-        if (!enriched) continue;
-
-        // Skip item dari map yang udah di-blok (misal map spam kayak "Flex UGC Codes")
+      for (const enriched of enrichedItems) {
         if (db.isMapBlocked({ gameName: enriched.gameName, universeId: enriched.universeId })) {
           console.log(`[poller] Skip item ${enriched.itemId} (${enriched.name}) - map di-blok: ${enriched.gameName}`);
-          continue;
-        }
-
-        // Filter kedua pake data yang udah di-enrich, jaga-jaga kalau raw search result ga ada totalQuantity-nya
-        if (config.minStock > 0 && enriched.quantityTotal !== null && enriched.quantityTotal < config.minStock) {
-          console.log(`[poller] Skip item ${enriched.itemId} (${enriched.name}) - stock ${enriched.quantityTotal} di bawah MIN_STOCK ${config.minStock}`);
           continue;
         }
 
         const wasTracked = db.getItem(enriched.itemId);
         const isSoldOut = enriched.quantityTotal !== null && enriched.quantityRemaining === 0;
 
-        const saved = db.upsertItem({
-          ...enriched,
-          status: isSoldOut ? 'soldout' : 'active',
-        });
+        db.upsertItem({ ...enriched, status: isSoldOut ? 'soldout' : 'active' });
 
         if (isSoldOut) {
-          // baru sold out sekarang (sebelumnya active / belum pernah diproses ke soldout channel)
           if (!wasTracked || wasTracked.status !== 'soldout') {
             await moveToSoldOut(client, enriched);
           }
         } else {
           await postOrUpdateLive(client, enriched);
         }
-
-        await sleep(250); // jaga-jaga rate limit Roblox API
       }
 
       if (!searchResult.nextCursor) {
@@ -204,7 +217,6 @@ async function runPollCycle(client) {
       cursor = searchResult.nextCursor;
     }
 
-    // Simpen posisi buat cycle berikutnya. Kalau abis (nyampe akhir katalog), muter balik ke awal.
     db.setLastCursor(reachedEnd ? '' : cursor);
 
     console.log(`[poller] Selesai. Total item dicek: ${totalChecked}${reachedEnd ? ' (nyampe akhir katalog, muter balik ke awal cycle berikutnya)' : ''}`);

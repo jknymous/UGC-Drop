@@ -16,20 +16,20 @@ function attachRetry(client) {
   client.interceptors.response.use(
     (res) => res,
     async (error) => {
-      const config = error.config;
-      if (!config) return Promise.reject(error);
-      config.__retryCount = config.__retryCount || 0;
+      const cfg = error.config;
+      if (!cfg) return Promise.reject(error);
+      cfg.__retryCount = cfg.__retryCount || 0;
 
       const isRateLimited = error.response && error.response.status === 429;
-      if (isRateLimited && config.__retryCount < 3) {
-        config.__retryCount += 1;
+      if (isRateLimited && cfg.__retryCount < 3) {
+        cfg.__retryCount += 1;
         const retryAfterHeader = error.response.headers['retry-after'];
         const waitMs = retryAfterHeader
           ? parseFloat(retryAfterHeader) * 1000
-          : 1000 * Math.pow(2, config.__retryCount); // exponential backoff: 2s, 4s, 8s
-        console.warn(`[robloxApi] Kena rate limit (429), retry ke-${config.__retryCount} setelah ${waitMs}ms...`);
+          : 1000 * Math.pow(2, cfg.__retryCount); // exponential backoff: 2s, 4s, 8s
+        console.warn(`[robloxApi] Kena rate limit (429), retry ke-${cfg.__retryCount} setelah ${waitMs}ms...`);
         await sleep(waitMs);
-        return client(config);
+        return client(cfg);
       }
       return Promise.reject(error);
     }
@@ -40,15 +40,13 @@ function attachRetry(client) {
 
 /**
  * Search catalog buat item Free (price 0) di kategori tertentu.
- * Docs resmi: https://create.roblox.com/docs/projects/assets/api
- * Endpoint ini yang dipake situs roblox.com/catalog sendiri.
  */
 async function searchFreeItems({ category = '11', subcategory = '', cursor = '' } = {}) {
   const params = {
     Category: category,
     MinPrice: 0,
     MaxPrice: 0,
-    SortType: 3, // Recently Updated - biar item baru nongol duluan
+    SortType: 3, // Recently Updated
     Limit: 30,
   };
   if (subcategory) params.Subcategory = subcategory;
@@ -62,11 +60,22 @@ async function searchFreeItems({ category = '11', subcategory = '', cursor = '' 
 }
 
 /**
- * Ambil detail lengkap 1 item (harga, quantity, sale location) via economy API.
- * NOTE: endpoint ini legacy tapi masih dipakai luas oleh komunitas dev Roblox
- * buat ambil field kayak SaleLocation & unitsAvailableForConsumption.
- * Kalau Roblox ubah struktur response-nya, sesuaikan parsing di bawah -
- * lu bisa cek response mentah dulu via console.log sebelum production.
+ * Ambil detail BANYAK item sekaligus dalam 1 request (endpoint batch resmi Roblox).
+ * Jauh lebih efisien daripada manggil getAssetDetails() satu-satu per item -
+ * ini kunci biar bot bisa cepet tanpa nembak API kebanyakan kali dan kena rate limit.
+ */
+async function getCatalogItemsDetailsBatch(itemIds = []) {
+  if (!itemIds.length) return [];
+  const { data } = await catalogClient.post('/v1/catalog/items/details', {
+    items: itemIds.map((id) => ({ itemType: 1, id })), // itemType 1 = Asset
+  });
+  return data.data || [];
+}
+
+/**
+ * Ambil detail lengkap 1 item (termasuk SaleLocation/map info) - dipake sebagai FALLBACK
+ * per-item cuma buat item yang lolos filter (jumlahnya jauh lebih sedikit daripada 1 halaman penuh),
+ * karena endpoint batch di atas biasanya ga selalu include SaleLocation.
  */
 async function getAssetDetails(assetId) {
   const { data } = await economyClient.get(`/v2/assets/${assetId}/details`);
@@ -74,7 +83,7 @@ async function getAssetDetails(assetId) {
 }
 
 /**
- * Ambil nama & root place (buat link "PLAY NOW") dari satu atau lebih universeId.
+ * Ambil nama & root place (buat link "PLAY NOW") dari satu atau lebih universeId sekaligus.
  */
 async function getUniverseInfo(universeIds = []) {
   if (!universeIds.length) return {};
@@ -93,7 +102,7 @@ async function getUniverseInfo(universeIds = []) {
 }
 
 /**
- * Ambil thumbnail image URL buat satu atau lebih item ID.
+ * Ambil thumbnail image URL buat BANYAK item sekaligus dalam 1 request.
  */
 async function getThumbnails(assetIds = [], size = '420x420') {
   if (!assetIds.length) return {};
@@ -114,6 +123,7 @@ async function getThumbnails(assetIds = [], size = '420x420') {
 
 module.exports = {
   searchFreeItems,
+  getCatalogItemsDetailsBatch,
   getAssetDetails,
   getUniverseInfo,
   getThumbnails,

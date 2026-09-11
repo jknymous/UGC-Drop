@@ -20,11 +20,10 @@ for (const file of commandFiles) {
 client.once('ready', () => {
   console.log(`✅ Bot login sebagai ${client.user.tag}`);
 
-  // Jalanin polling pertama kali begitu bot online
   runPollCycle(client).catch((err) => console.error('[poller] Error di cycle pertama:', err));
 
-  // Jadwalin polling berkala sesuai interval di .env (support granularity detik)
-  const cronExpr = `*/${config.pollIntervalSeconds} * * * * *`; // format 6-field: detik menit jam tanggal bulan hari
+  // Jadwalin polling berkala sesuai interval di .env (support granularity detik, format 6-field cron)
+  const cronExpr = `*/${config.pollIntervalSeconds} * * * * *`;
   cron.schedule(cronExpr, () => {
     runPollCycle(client).catch((err) => console.error('[poller] Error di scheduled cycle:', err));
   });

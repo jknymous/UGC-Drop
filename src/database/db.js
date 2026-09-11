@@ -138,9 +138,6 @@ module.exports = {
     return db.prepare('SELECT * FROM blocked_maps ORDER BY id').all();
   },
 
-  /**
-   * Cek apakah sebuah item (berdasarkan game name / universe id) masuk daftar blokir.
-   */
   isMapBlocked({ gameName, universeId }) {
     const blocked = module.exports.getBlockedMaps();
     return blocked.some((b) => {
