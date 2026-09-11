@@ -7,36 +7,61 @@ const gamesClient = axios.create({ baseURL: 'https://games.roblox.com', timeout:
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+// Roblox mewajibkan CSRF token buat request POST/PUT/DELETE. Token ini didapet dari
+// header response `x-csrf-token` begitu kita kena 403 pertama kali - lalu dipake buat semua
+// request POST berikutnya. Disimpen di module-level biar reusable antar request.
+let csrfToken = null;
+
 /**
- * Attach retry-with-backoff interceptor buat semua client - kalau kena 429 (rate limited),
- * tunggu sesuai header Retry-After (atau exponential backoff kalau ga ada header itu), lalu retry.
- * Max 3x retry per request biar ga infinite loop kalau Roblox lagi down beneran.
+ * Attach interceptor: (1) sisipin CSRF token ke tiap request kalau udah ada,
+ * (2) kalau kena 403 dan responsnya bawa token baru, simpen & retry sekali,
+ * (3) kalau kena 429 (rate limited), retry pake backoff (max 3x).
  */
-function attachRetry(client) {
+function attachInterceptors(client) {
+  client.interceptors.request.use((cfg) => {
+    if (csrfToken) {
+      cfg.headers = { ...cfg.headers, 'x-csrf-token': csrfToken };
+    }
+    return cfg;
+  });
+
   client.interceptors.response.use(
     (res) => res,
     async (error) => {
       const cfg = error.config;
-      if (!cfg) return Promise.reject(error);
-      cfg.__retryCount = cfg.__retryCount || 0;
+      if (!cfg || !error.response) return Promise.reject(error);
 
-      const isRateLimited = error.response && error.response.status === 429;
-      if (isRateLimited && cfg.__retryCount < 3) {
+      cfg.__retryCount = cfg.__retryCount || 0;
+      cfg.__csrfRetried = cfg.__csrfRetried || false;
+
+      // Kasus 1: butuh CSRF token (khusus request POST/PUT/DELETE ke Roblox)
+      const newCsrfToken = error.response.headers['x-csrf-token'];
+      if (error.response.status === 403 && newCsrfToken && !cfg.__csrfRetried) {
+        csrfToken = newCsrfToken;
+        cfg.__csrfRetried = true;
+        cfg.headers = { ...cfg.headers, 'x-csrf-token': csrfToken };
+        console.warn('[robloxApi] Dapet CSRF token baru, retry request sekali...');
+        return client(cfg);
+      }
+
+      // Kasus 2: kena rate limit
+      if (error.response.status === 429 && cfg.__retryCount < 3) {
         cfg.__retryCount += 1;
         const retryAfterHeader = error.response.headers['retry-after'];
         const waitMs = retryAfterHeader
           ? parseFloat(retryAfterHeader) * 1000
-          : 1000 * Math.pow(2, cfg.__retryCount); // exponential backoff: 2s, 4s, 8s
+          : 1000 * Math.pow(2, cfg.__retryCount); // 2s, 4s, 8s
         console.warn(`[robloxApi] Kena rate limit (429), retry ke-${cfg.__retryCount} setelah ${waitMs}ms...`);
         await sleep(waitMs);
         return client(cfg);
       }
+
       return Promise.reject(error);
     }
   );
 }
 
-[catalogClient, economyClient, thumbnailsClient, gamesClient].forEach(attachRetry);
+[catalogClient, economyClient, thumbnailsClient, gamesClient].forEach(attachInterceptors);
 
 /**
  * Search catalog buat item Free (price 0) di kategori tertentu.
@@ -60,9 +85,8 @@ async function searchFreeItems({ category = '11', subcategory = '', cursor = '' 
 }
 
 /**
- * Ambil detail BANYAK item sekaligus dalam 1 request (endpoint batch resmi Roblox).
- * Jauh lebih efisien daripada manggil getAssetDetails() satu-satu per item -
- * ini kunci biar bot bisa cepet tanpa nembak API kebanyakan kali dan kena rate limit.
+ * Ambil detail BANYAK item sekaligus dalam 1 request (endpoint batch resmi Roblox, POST -
+ * makanya butuh CSRF token, udah di-handle otomatis sama interceptor di atas).
  */
 async function getCatalogItemsDetailsBatch(itemIds = []) {
   if (!itemIds.length) return [];
@@ -73,9 +97,8 @@ async function getCatalogItemsDetailsBatch(itemIds = []) {
 }
 
 /**
- * Ambil detail lengkap 1 item (termasuk SaleLocation/map info) - dipake sebagai FALLBACK
- * per-item cuma buat item yang lolos filter (jumlahnya jauh lebih sedikit daripada 1 halaman penuh),
- * karena endpoint batch di atas biasanya ga selalu include SaleLocation.
+ * Ambil detail lengkap 1 item (termasuk SaleLocation/map info) - fallback per-item
+ * cuma buat item yang lolos filter dan ga ketemu SaleLocation-nya dari batch.
  */
 async function getAssetDetails(assetId) {
   const { data } = await economyClient.get(`/v2/assets/${assetId}/details`);
@@ -83,7 +106,7 @@ async function getAssetDetails(assetId) {
 }
 
 /**
- * Ambil nama & root place (buat link "PLAY NOW") dari satu atau lebih universeId sekaligus.
+ * Ambil nama & root place dari satu atau lebih universeId sekaligus.
  */
 async function getUniverseInfo(universeIds = []) {
   if (!universeIds.length) return {};
