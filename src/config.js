@@ -16,8 +16,14 @@ module.exports = {
   liveChannelId: required('LIVE_CHANNEL_ID'),
   soldoutChannelId: required('SOLDOUT_CHANNEL_ID'),
 
+  // Jalur cepat: selalu cek halaman terbaru doang, sengaja kecil & sering biar ga numpuk.
+  hotIntervalSeconds: parseInt(process.env.HOT_INTERVAL_SECONDS || '15', 10),
+  hotMaxPages: parseInt(process.env.HOT_MAX_PAGES || '2', 10),
+
+  // Jalur coverage: rotating scan buat mastiin seluruh katalog ke-cover lama-lama.
   pollIntervalSeconds: parseInt(process.env.POLL_INTERVAL_SECONDS || '45', 10),
   pollMaxPages: parseInt(process.env.POLL_MAX_PAGES || '10', 10),
+
   minStock: parseInt(process.env.MIN_STOCK || '0', 10),
 
   catalogCategory: process.env.CATALOG_CATEGORY || '11',

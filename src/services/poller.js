@@ -5,20 +5,19 @@ const config = require('../config');
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-let isRunning = false;
+let isHotRunning = false;
+let isCoverageRunning = false;
 
 /**
- * Proses 1 halaman hasil search sekaligus (bukan 1 item per 1 item lagi):
+ * Proses 1 halaman hasil search sekaligus:
  * - Filter awal pake data mentah (MIN_STOCK) SEBELUM manggil API apapun lagi.
  * - Batch call buat detail (1 request buat semua item yang lolos filter).
  * - Batch call buat thumbnail (1 request).
- * - SaleLocation (map/game info): coba dari batch details dulu, kalau ga ada baru fallback
- *   ke economy API PER ITEM - tapi cuma buat item yang udah lolos filter (jauh lebih dikit
- *   daripada 1 halaman penuh), jadi tetep hemat request dibanding sebelumnya.
+ * - SaleLocation (map/game info): coba dari batch details dulu, fallback per-item cuma
+ *   buat sisa kecil yang emang butuh.
  * - Universe/game name di-resolve sekali per halaman (batch), bukan per item.
  */
 async function enrichPage(rawItems) {
-  // 1. Filter awal pake raw data - skip item stock kecil TANPA fetch apapun.
   const candidates = rawItems.filter((raw) => {
     const rawTotalQty = raw.totalQuantity ?? null;
     if (config.minStock > 0 && rawTotalQty !== null && rawTotalQty < config.minStock) return false;
@@ -29,7 +28,6 @@ async function enrichPage(rawItems) {
 
   const ids = candidates.map((c) => c.id);
 
-  // 2. Batch detail (1 request buat semua item di halaman ini)
   let batchDetailsMap = {};
   try {
     const batch = await robloxApi.getCatalogItemsDetailsBatch(ids);
@@ -38,7 +36,6 @@ async function enrichPage(rawItems) {
     console.warn('[poller] Batch details gagal, lanjut pake data search doang:', err.message);
   }
 
-  // 3. Batch thumbnail (1 request buat semua item)
   let thumbs = {};
   try {
     thumbs = await robloxApi.getThumbnails(ids);
@@ -46,7 +43,6 @@ async function enrichPage(rawItems) {
     console.warn('[poller] Batch thumbnail gagal:', err.message);
   }
 
-  // 4. Susun data dasar tiap item dulu, kumpulin mana yang masih butuh SaleLocation fallback
   const enrichedDraft = [];
   const needsSaleLocationLookup = [];
 
@@ -69,30 +65,23 @@ async function enrichPage(rawItems) {
       gameUrl: null,
     };
 
-    if (!universeIdFromBatch) {
-      needsSaleLocationLookup.push(draft);
-    }
-
+    if (!universeIdFromBatch) needsSaleLocationLookup.push(draft);
     enrichedDraft.push(draft);
   }
 
-  // 5. Fallback SaleLocation PER ITEM cuma buat yang emang ga ketemu dari batch details -
-  // biasanya ini sisa kecil doang, bukan seluruh halaman.
   for (const draft of needsSaleLocationLookup) {
     try {
       const details = await robloxApi.getAssetDetails(draft.itemId);
       const universeIds = details?.SaleLocation?.UniverseIds || details?.saleLocation?.universeIds || [];
       if (universeIds.length) draft.universeId = universeIds[0];
-      // sekalian ambil quantity dari sini kalau masih kosong
       if (draft.quantityTotal === null) draft.quantityTotal = details.TotalQuantity ?? details.totalQuantity ?? null;
       if (draft.quantityRemaining === null) draft.quantityRemaining = details.UnitsAvailableForConsumption ?? details.unitsAvailableForConsumption ?? null;
-      await sleep(80); // tetep jaga rate limit walau ini fallback dikit
+      await sleep(80);
     } catch (err) {
-      // gagal ambil SaleLocation buat item ini, ga masalah - lanjut aja tanpa map info
+      // gagal ambil SaleLocation, ga masalah - lanjut tanpa map info
     }
   }
 
-  // 6. Resolve semua universeId yang berhasil ketemu jadi nama game - SEKALIGUS (1 request)
   const uniqueUniverseIds = [...new Set(enrichedDraft.filter((d) => d.universeId).map((d) => d.universeId))];
   let universeInfo = {};
   if (uniqueUniverseIds.length) {
@@ -108,7 +97,6 @@ async function enrichPage(rawItems) {
       draft.gameName = universeInfo[draft.universeId].name;
       draft.gameUrl = universeInfo[draft.universeId].url;
     }
-    // Fallback terakhir: manual override dari admin (/addmapinfo)
     if (!draft.gameName) {
       const override = db.getMapOverride(draft.itemId);
       if (override) {
@@ -159,13 +147,83 @@ async function moveToSoldOut(client, item) {
   db.setSoldoutMessageId(item.itemId, msg.id);
 }
 
-async function runPollCycle(client) {
-  if (isRunning) {
-    console.log('[poller] Cycle sebelumnya masih jalan, skip cycle ini biar ga numpuk.');
+/**
+ * Proses 1 halaman hasil search: enrich, filter blocklist, upsert DB, post/update Discord.
+ * Dipake bareng sama hot lane & coverage lane biar logic-nya ga kedobelan.
+ */
+async function processPage(client, rawItems) {
+  const enrichedItems = await enrichPage(rawItems);
+
+  for (const enriched of enrichedItems) {
+    if (db.isMapBlocked({ gameName: enriched.gameName, universeId: enriched.universeId })) {
+      console.log(`[poller] Skip item ${enriched.itemId} (${enriched.name}) - map di-blok: ${enriched.gameName}`);
+      continue;
+    }
+
+    const wasTracked = db.getItem(enriched.itemId);
+    const isSoldOut = enriched.quantityTotal !== null && enriched.quantityRemaining === 0;
+
+    db.upsertItem({ ...enriched, status: isSoldOut ? 'soldout' : 'active' });
+
+    if (isSoldOut) {
+      if (!wasTracked || wasTracked.status !== 'soldout') {
+        await moveToSoldOut(client, enriched);
+      }
+    } else {
+      await postOrUpdateLive(client, enriched);
+    }
+  }
+}
+
+/**
+ * JALUR CEPAT ("hot lane"): SELALU mulai dari halaman 1 (cursor kosong), TANPA rotasi.
+ * Karena search di-sort "Recently Updated", halaman 1 ini tempat item TERBARU nongol -
+ * dari CREATOR MANAPUN, ga peduli udah pernah ketemu sebelumnya atau belum.
+ * Scope-nya sengaja dikecilin (dikit halaman) biar cycle-nya super cepet kelar dan
+ * bisa di-jadwalin sering banget tanpa numpuk.
+ */
+async function runHotScan(client) {
+  if (isHotRunning) return; // diem-diem aja, ga usah log tiap skip biar log ga penuh
+  isHotRunning = true;
+  try {
+    let totalChecked = 0;
+    for (let page = 0; page < config.hotMaxPages; page++) {
+      let searchResult;
+      try {
+        searchResult = await robloxApi.searchFreeItems({
+          category: config.catalogCategory,
+          subcategory: config.catalogSubcategory,
+          cursor: '', // TIDAK pake cursor tersimpan - selalu dari atas
+        });
+      } catch (err) {
+        console.error('[poller:hot] Gagal search catalog:', err.message);
+        break;
+      }
+      totalChecked += searchResult.items.length;
+      await processPage(client, searchResult.items);
+      // hot lane cuma jalan di 1-2 halaman teratas, ga perlu nerusin ke halaman berikutnya
+      // pake cursor searchResult.nextCursor karena tujuannya emang cuma cek yang paling baru
+      if (!searchResult.nextCursor) break;
+      // kalau mau lebih dari 1 halaman, lanjut pake cursor dari sini (bukan cursor tersimpan)
+    }
+    console.log(`[poller:hot] Cek ${totalChecked} item di halaman terbaru.`);
+  } finally {
+    isHotRunning = false;
+  }
+}
+
+/**
+ * JALUR COVERAGE (rotating scan yang udah ada): lanjut dari posisi terakhir biar
+ * SELURUH katalog ke-cover lama-lama, jaga-jaga ada anomali sorting yang bikin
+ * hot lane kelewat sesuatu.
+ */
+async function runCoverageScan(client) {
+  if (isCoverageRunning) {
+    console.log('[poller:coverage] Cycle sebelumnya masih jalan, skip cycle ini biar ga numpuk.');
     return;
   }
-  isRunning = true;
-  console.log(`[poller] Mulai polling cycle - ${new Date().toISOString()}`);
+  isCoverageRunning = true;
+  console.log(`[poller:coverage] Mulai polling cycle - ${new Date().toISOString()}`);
 
   try {
     let cursor = db.getLastCursor();
@@ -182,33 +240,12 @@ async function runPollCycle(client) {
           cursor,
         });
       } catch (err) {
-        console.error('[poller] Gagal search catalog:', err.message);
+        console.error('[poller:coverage] Gagal search catalog:', err.message);
         break;
       }
 
       totalChecked += searchResult.items.length;
-
-      const enrichedItems = await enrichPage(searchResult.items);
-
-      for (const enriched of enrichedItems) {
-        if (db.isMapBlocked({ gameName: enriched.gameName, universeId: enriched.universeId })) {
-          console.log(`[poller] Skip item ${enriched.itemId} (${enriched.name}) - map di-blok: ${enriched.gameName}`);
-          continue;
-        }
-
-        const wasTracked = db.getItem(enriched.itemId);
-        const isSoldOut = enriched.quantityTotal !== null && enriched.quantityRemaining === 0;
-
-        db.upsertItem({ ...enriched, status: isSoldOut ? 'soldout' : 'active' });
-
-        if (isSoldOut) {
-          if (!wasTracked || wasTracked.status !== 'soldout') {
-            await moveToSoldOut(client, enriched);
-          }
-        } else {
-          await postOrUpdateLive(client, enriched);
-        }
-      }
+      await processPage(client, searchResult.items);
 
       if (!searchResult.nextCursor) {
         reachedEnd = true;
@@ -218,11 +255,10 @@ async function runPollCycle(client) {
     }
 
     db.setLastCursor(reachedEnd ? '' : cursor);
-
-    console.log(`[poller] Selesai. Total item dicek: ${totalChecked}${reachedEnd ? ' (nyampe akhir katalog, muter balik ke awal cycle berikutnya)' : ''}`);
+    console.log(`[poller:coverage] Selesai. Total item dicek: ${totalChecked}${reachedEnd ? ' (nyampe akhir katalog, muter balik ke awal cycle berikutnya)' : ''}`);
   } finally {
-    isRunning = false;
+    isCoverageRunning = false;
   }
 }
 
-module.exports = { runPollCycle };
+module.exports = { runHotScan, runCoverageScan };

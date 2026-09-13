@@ -3,7 +3,7 @@ const path = require('path');
 const { Client, GatewayIntentBits, Collection } = require('discord.js');
 const cron = require('node-cron');
 const config = require('./config');
-const { runPollCycle } = require('./services/poller');
+const { runHotScan, runCoverageScan } = require('./services/poller');
 
 const client = new Client({
   intents: [GatewayIntentBits.Guilds],
@@ -20,15 +20,21 @@ for (const file of commandFiles) {
 client.once('ready', () => {
   console.log(`✅ Bot login sebagai ${client.user.tag}`);
 
-  runPollCycle(client).catch((err) => console.error('[poller] Error di cycle pertama:', err));
+  // Jalanin sekali di awal
+  runHotScan(client).catch((err) => console.error('[poller:hot] Error di scan pertama:', err));
+  runCoverageScan(client).catch((err) => console.error('[poller:coverage] Error di cycle pertama:', err));
 
-  // Jadwalin polling berkala sesuai interval di .env (support granularity detik, format 6-field cron)
-  const cronExpr = `*/${config.pollIntervalSeconds} * * * * *`;
-  cron.schedule(cronExpr, () => {
-    runPollCycle(client).catch((err) => console.error('[poller] Error di scheduled cycle:', err));
+  // Jalur cepat - selalu cek halaman terbaru, interval pendek
+  cron.schedule(`*/${config.hotIntervalSeconds} * * * * *`, () => {
+    runHotScan(client).catch((err) => console.error('[poller:hot] Error:', err));
   });
 
-  console.log(`⏰ Polling dijadwalin tiap ${config.pollIntervalSeconds} detik.`);
+  // Jalur coverage - rotating scan, interval lebih panjang
+  cron.schedule(`*/${config.pollIntervalSeconds} * * * * *`, () => {
+    runCoverageScan(client).catch((err) => console.error('[poller:coverage] Error:', err));
+  });
+
+  console.log(`⏰ Hot lane tiap ${config.hotIntervalSeconds} detik | Coverage lane tiap ${config.pollIntervalSeconds} detik.`);
 });
 
 client.on('interactionCreate', async (interaction) => {
