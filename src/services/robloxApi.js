@@ -66,7 +66,7 @@ function attachInterceptors(client) {
 /**
  * Search catalog buat item Free (price 0) di kategori tertentu.
  */
-async function searchFreeItems({ category = '11', subcategory = '', cursor = '' } = {}) {
+async function searchFreeItems({ category = '11', subcategory = '', cursor = '', bypassCache = false } = {}) {
   const params = {
     Category: category,
     MinPrice: 0,
@@ -76,6 +76,10 @@ async function searchFreeItems({ category = '11', subcategory = '', cursor = '' 
   };
   if (subcategory) params.Subcategory = subcategory;
   if (cursor) params.Cursor = cursor;
+  // Cache-busting: nambahin param random/timestamp biar CDN/edge cache Roblox ga ngasih
+  // response basi yang sama berulang-ulang. TRADE-OFF: ini bikin request kita selalu
+  // nembak origin server asli (bukan cache), jadi risiko kena 429 naik lagi.
+  if (bypassCache) params._cb = Date.now();
 
   const { data } = await catalogClient.get('/v1/search/items/details', { params });
   return {
