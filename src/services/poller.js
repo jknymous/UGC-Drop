@@ -200,6 +200,13 @@ async function runHotScan(client) {
         break;
       }
       totalChecked += searchResult.items.length;
+
+      // DEBUG: log field mentah dari item pertama biar kita bisa VERIFIKASI apa SortType=3
+      // beneran nyortir berdasarkan waktu publish/update, atau ternyata engga.
+      if (searchResult.items.length > 0) {
+        console.log('[poller:hot:DEBUG] Raw item pertama di halaman ini:', JSON.stringify(searchResult.items[0]));
+      }
+
       await processPage(client, searchResult.items);
       // hot lane cuma jalan di 1-2 halaman teratas, ga perlu nerusin ke halaman berikutnya
       // pake cursor searchResult.nextCursor karena tujuannya emang cuma cek yang paling baru
