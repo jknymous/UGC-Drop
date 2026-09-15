@@ -194,7 +194,8 @@ async function runHotScan(client) {
           category: config.catalogCategory,
           subcategory: config.catalogSubcategory,
           cursor: '', // TIDAK pake cursor tersimpan - selalu dari atas
-          bypassCache: true, // eksperimen: paksa skip cache biar dapet data fresh, bukan snapshot basi
+          // bypassCache dicoba sebelumnya, tapi kebukti ga ngaruh (item teratas tetep sama)
+          // dan malah naikin rate limit tanpa manfaat - jadi di-nonaktifin lagi.
         });
       } catch (err) {
         console.error('[poller:hot] Gagal search catalog:', err.message);
